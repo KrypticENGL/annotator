@@ -5,6 +5,8 @@
 pub enum Button {
     Grip,
     Mode,
+    /// Index into `gfx::Shape::ALL`.
+    Shape(usize),
     Color(usize),
     Undo,
     Clear,
@@ -21,9 +23,15 @@ pub const COLORS: [[f32; 3]; 4] = [
     [1.00, 0.84, 0.00], // yellow
 ];
 
-const ITEMS: [(Button, f32); 9] = [
+const ITEMS: [(Button, f32); 15] = [
     (Button::Grip, 18.0),
     (Button::Mode, 64.0),
+    (Button::Shape(0), 36.0),
+    (Button::Shape(1), 36.0),
+    (Button::Shape(2), 36.0),
+    (Button::Shape(3), 36.0),
+    (Button::Shape(4), 36.0),
+    (Button::Shape(5), 36.0),
     (Button::Color(0), 36.0),
     (Button::Color(1), 36.0),
     (Button::Color(2), 36.0),

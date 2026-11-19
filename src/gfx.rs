@@ -15,11 +15,101 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::core::*;
 use windows_numerics::{Matrix3x2, Vector2};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// The selection tool; never stored in a `Stroke`.
+    Select,
+    Pen,
+    Line,
+    Arrow,
+    Rect,
+    Ellipse,
+}
+
+impl Shape {
+    /// Toolbar order; `Button::Shape(i)` indexes this.
+    pub const ALL: [Shape; 6] = [Shape::Select, Shape::Pen, Shape::Line, Shape::Arrow, Shape::Rect, Shape::Ellipse];
+
+    /// Toolbar icon geometry around (cx, cy), in DIPs.
+    fn icon_points(self, cx: f32, cy: f32) -> Vec<Vector2> {
+        let pts: &[(f32, f32)] = match self {
+            // Mouse-pointer outline, drawn as a Pen polyline.
+            Shape::Select => &[(-4.0, -8.0), (-4.0, 7.0), (0.0, 3.0), (3.0, 9.0), (5.0, 8.0), (2.0, 2.0), (7.0, 2.0), (-4.0, -8.0)],
+            Shape::Pen => &[(-8.0, 4.0), (-3.0, -4.0), (2.0, 4.0), (7.0, -4.0)],
+            Shape::Line | Shape::Arrow => &[(-7.0, 7.0), (7.0, -7.0)],
+            Shape::Rect | Shape::Ellipse => &[(-8.0, -6.0), (8.0, 6.0)],
+        };
+        pts.iter().map(|&(x, y)| Vector2 { X: cx + x, Y: cy + y }).collect()
+    }
+}
+
 pub struct Stroke {
+    pub shape: Shape,
     pub color: D2D1_COLOR_F,
     pub width: f32,
-    /// Screen coordinates in physical pixels.
+    /// Screen coordinates in physical pixels. Shapes other than Pen hold [start, end].
     pub points: Vec<Vector2>,
+}
+
+impl Stroke {
+    /// The drawn outline as line segments; used for hit testing and bounds.
+    fn segments(&self) -> Vec<(Vector2, Vector2)> {
+        let v = |x, y| Vector2 { X: x, Y: y };
+        let chain = |pts: &[Vector2]| pts.windows(2).map(|w| (w[0], w[1])).collect();
+        match (self.shape, &self.points[..]) {
+            (Shape::Pen, &[p]) => vec![(p, p)],
+            (Shape::Pen, pts) => chain(pts),
+            (Shape::Line, &[a, b]) => vec![(a, b)],
+            (Shape::Arrow, &[a, b]) => {
+                let wings = arrow_wings(a, b, self.width * 4.0);
+                std::iter::once((a, b)).chain(wings.into_iter().map(|w| (b, w))).collect()
+            }
+            (Shape::Rect, &[a, b]) => chain(&[a, v(b.X, a.Y), b, v(a.X, b.Y), a]),
+            (Shape::Ellipse, &[a, b]) => {
+                let (cx, cy) = ((a.X + b.X) / 2.0, (a.Y + b.Y) / 2.0);
+                let (rx, ry) = ((b.X - a.X).abs() / 2.0, (b.Y - a.Y).abs() / 2.0);
+                let pts: Vec<_> = (0..=32)
+                    .map(|i| (i as f32 * std::f32::consts::TAU / 32.0).sin_cos())
+                    .map(|(s, c)| v(cx + rx * c, cy + ry * s))
+                    .collect();
+                chain(&pts)
+            }
+            _ => vec![],
+        }
+    }
+
+    /// True if `p` is within `tol` of the drawn ink (outline only, not the interior).
+    pub fn hit(&self, p: Vector2, tol: f32) -> bool {
+        let r = self.width / 2.0 + tol;
+        self.segments().iter().any(|&(a, b)| seg_dist(p, a, b) <= r)
+    }
+
+    pub fn bounds(&self) -> D2D_RECT_F {
+        let pad = self.width / 2.0;
+        let mut r = D2D_RECT_F { left: f32::MAX, top: f32::MAX, right: f32::MIN, bottom: f32::MIN };
+        for p in self.segments().into_iter().flat_map(|(a, b)| [a, b]) {
+            r.left = r.left.min(p.X - pad);
+            r.top = r.top.min(p.Y - pad);
+            r.right = r.right.max(p.X + pad);
+            r.bottom = r.bottom.max(p.Y + pad);
+        }
+        r
+    }
+
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        for p in &mut self.points {
+            p.X += dx;
+            p.Y += dy;
+        }
+    }
+}
+
+/// Distance from `p` to the segment a-b.
+fn seg_dist(p: Vector2, a: Vector2, b: Vector2) -> f32 {
+    let (dx, dy) = (b.X - a.X, b.Y - a.Y);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 == 0.0 { 0.0 } else { (((p.X - a.X) * dx + (p.Y - a.Y) * dy) / len2).clamp(0.0, 1.0) };
+    (p.X - a.X - t * dx).hypot(p.Y - a.Y - t * dy)
 }
 
 pub fn rgb(c: [f32; 3], a: f32) -> D2D1_COLOR_F {
@@ -101,16 +191,7 @@ impl OverlayGfx {
             dcomp.Commit()?;
 
             let brush = ctx.CreateSolidColorBrush(&BORDER, None)?;
-            let round = factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES1 {
-                    startCap: D2D1_CAP_STYLE_ROUND,
-                    endCap: D2D1_CAP_STYLE_ROUND,
-                    dashCap: D2D1_CAP_STYLE_ROUND,
-                    lineJoin: D2D1_LINE_JOIN_ROUND,
-                    ..Default::default()
-                },
-                None,
-            )?;
+            let round = round_style(factory)?;
             Ok(Self { swap, ctx, brush, round, _dcomp: (dcomp, dtarget, visual) })
         }
     }
@@ -122,6 +203,7 @@ impl OverlayGfx {
         origin: (i32, i32),
         strokes: impl Iterator<Item = &'a Stroke>,
         border: Option<&[RECT]>,
+        selection: Option<D2D_RECT_F>,
     ) -> Result<()> {
         unsafe {
             let ctx = &self.ctx;
@@ -131,13 +213,12 @@ impl OverlayGfx {
             // shortcut: redraws every stroke each frame; cache committed ink in a bitmap if this gets slow.
             for s in strokes {
                 self.brush.SetColor(&s.color);
-                if let [p] = s.points[..] {
-                    let r = s.width / 2.0;
-                    ctx.FillEllipse(&D2D1_ELLIPSE { point: p, radiusX: r, radiusY: r }, &self.brush);
-                }
-                for w in s.points.windows(2) {
-                    ctx.DrawLine(w[0], w[1], &self.brush, s.width, &self.round);
-                }
+                draw_stroke(ctx, s.shape, &s.points, s.width, &self.brush, &self.round);
+            }
+            if let Some(r) = selection {
+                self.brush.SetColor(&BORDER);
+                let r = D2D_RECT_F { left: r.left - 4.0, top: r.top - 4.0, right: r.right + 4.0, bottom: r.bottom + 4.0 };
+                ctx.DrawRectangle(&r, &self.brush, 2.0, None);
             }
             if let Some(mons) = border {
                 self.brush.SetColor(&BORDER);
@@ -157,10 +238,82 @@ impl OverlayGfx {
     }
 }
 
+/// Shared by the overlay ink and the toolbar's shape icons.
+fn draw_stroke(
+    rt: &ID2D1RenderTarget,
+    shape: Shape,
+    points: &[Vector2],
+    width: f32,
+    brush: &ID2D1SolidColorBrush,
+    style: &ID2D1StrokeStyle,
+) {
+    unsafe {
+        match (shape, points) {
+            (Shape::Pen, &[p]) => {
+                let r = width / 2.0;
+                rt.FillEllipse(&D2D1_ELLIPSE { point: p, radiusX: r, radiusY: r }, brush);
+            }
+            (Shape::Pen, pts) => {
+                for w in pts.windows(2) {
+                    rt.DrawLine(w[0], w[1], brush, width, style);
+                }
+            }
+            (Shape::Line, &[a, b]) => rt.DrawLine(a, b, brush, width, style),
+            (Shape::Arrow, &[a, b]) => {
+                rt.DrawLine(a, b, brush, width, style);
+                for w in arrow_wings(a, b, width * 4.0) {
+                    rt.DrawLine(b, w, brush, width, style);
+                }
+            }
+            (Shape::Rect, &[a, b]) => {
+                let r = D2D_RECT_F { left: a.X.min(b.X), top: a.Y.min(b.Y), right: a.X.max(b.X), bottom: a.Y.max(b.Y) };
+                rt.DrawRectangle(&r, brush, width, style);
+            }
+            (Shape::Ellipse, &[a, b]) => {
+                let e = D2D1_ELLIPSE {
+                    point: Vector2 { X: (a.X + b.X) / 2.0, Y: (a.Y + b.Y) / 2.0 },
+                    radiusX: (b.X - a.X).abs() / 2.0,
+                    radiusY: (b.Y - a.Y).abs() / 2.0,
+                };
+                rt.DrawEllipse(&e, brush, width, style);
+            }
+            _ => {} // a shape that has only its start point yet
+        }
+    }
+}
+
+fn round_style(factory: &ID2D1Factory1) -> Result<ID2D1StrokeStyle1> {
+    unsafe {
+        factory.CreateStrokeStyle(
+            &D2D1_STROKE_STYLE_PROPERTIES1 {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_ROUND,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+}
+
+/// Tips of the two arrowhead strokes at `b`, each `len` long and 30° off the shaft.
+fn arrow_wings(a: Vector2, b: Vector2, len: f32) -> Vec<Vector2> {
+    let (dx, dy) = (a.X - b.X, a.Y - b.Y);
+    let d = dx.hypot(dy);
+    if d == 0.0 {
+        return vec![];
+    }
+    let (ux, uy) = (dx / d * len, dy / d * len);
+    let (sin, cos) = 30f32.to_radians().sin_cos();
+    [sin, -sin].map(|s| Vector2 { X: b.X + ux * cos - uy * s, Y: b.Y + ux * s + uy * cos }).to_vec()
+}
+
 pub struct ToolbarGfx {
     rt: ID2D1HwndRenderTarget,
     brush: ID2D1SolidColorBrush,
     text: IDWriteTextFormat,
+    round: ID2D1StrokeStyle1,
 }
 
 impl ToolbarGfx {
@@ -191,11 +344,11 @@ impl ToolbarGfx {
             )?;
             text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            Ok(Self { rt, brush, text })
+            Ok(Self { rt, brush, text, round: round_style(factory)? })
         }
     }
 
-    pub fn render(&self, drawing: bool, color: usize) -> Result<()> {
+    pub fn render(&self, drawing: bool, color: usize, shape: Shape) -> Result<()> {
         let gray = rgb([0.24, 0.25, 0.27], 1.0);
         let white = rgb([0.95, 0.95, 0.95], 1.0);
         unsafe {
@@ -235,6 +388,18 @@ impl ToolbarGfx {
                         self.brush.SetColor(&gray);
                         "Pass"
                     }
+                    Button::Shape(i) => {
+                        let s = Shape::ALL[i];
+                        if s == shape {
+                            self.brush.SetColor(&gray);
+                            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 5.0, radiusY: 5.0 }, &self.brush);
+                        }
+                        self.brush.SetColor(&white);
+                        let pts = s.icon_points((x0 + x1) / 2.0, layout::HEIGHT / 2.0);
+                        let kind = if s == Shape::Select { Shape::Pen } else { s };
+                        draw_stroke(rt, kind, &pts, 2.0, &self.brush, &self.round);
+                        continue;
+                    }
                     Button::Undo => {
                         self.brush.SetColor(&gray);
                         "Undo"
@@ -262,5 +427,60 @@ impl ToolbarGfx {
             }
             rt.EndDraw(None, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_has_one_button_per_shape() {
+        let idx: Vec<usize> = layout::items().filter_map(|(b, ..)| if let Button::Shape(i) = b { Some(i) } else { None }).collect();
+        assert_eq!(idx, (0..Shape::ALL.len()).collect::<Vec<_>>());
+    }
+
+    fn stroke(shape: Shape, pts: &[(f32, f32)]) -> Stroke {
+        let points = pts.iter().map(|&(x, y)| Vector2 { X: x, Y: y }).collect();
+        Stroke { shape, color: CLEAR, width: 2.0, points }
+    }
+
+    #[test]
+    fn hit_testing_follows_the_outline() {
+        let p = |x, y| Vector2 { X: x, Y: y };
+        let line = stroke(Shape::Line, &[(0.0, 0.0), (100.0, 0.0)]);
+        assert!(line.hit(p(50.0, 5.0), 5.0));
+        assert!(!line.hit(p(50.0, 7.0), 5.0));
+        assert!(!line.hit(p(110.0, 0.0), 5.0));
+
+        let rect = stroke(Shape::Rect, &[(100.0, 100.0), (0.0, 0.0)]);
+        assert!(rect.hit(p(100.0, 50.0), 1.0));
+        assert!(!rect.hit(p(50.0, 50.0), 1.0)); // interior is click-through
+
+        let oval = stroke(Shape::Ellipse, &[(0.0, 0.0), (100.0, 50.0)]);
+        assert!(oval.hit(p(50.0, 0.0), 1.0) && oval.hit(p(100.0, 25.0), 1.0));
+        assert!(!oval.hit(p(50.0, 25.0), 1.0));
+
+        let dot = stroke(Shape::Pen, &[(10.0, 10.0)]);
+        assert!(dot.hit(p(12.0, 10.0), 1.0));
+    }
+
+    #[test]
+    fn translate_moves_bounds() {
+        let mut s = stroke(Shape::Rect, &[(10.0, 20.0), (30.0, 40.0)]);
+        s.translate(5.0, -5.0);
+        let b = s.bounds();
+        assert_eq!((b.left, b.top, b.right, b.bottom), (14.0, 14.0, 36.0, 36.0));
+    }
+
+    #[test]
+    fn arrow_wings_point_back_symmetrically() {
+        let w = arrow_wings(Vector2 { X: 0.0, Y: 0.0 }, Vector2 { X: 10.0, Y: 0.0 }, 2.0);
+        assert_eq!(w.len(), 2);
+        for p in &w {
+            assert!(p.X < 10.0 && ((p.X - 10.0).hypot(p.Y) - 2.0).abs() < 1e-4);
+        }
+        assert!((w[0].Y + w[1].Y).abs() < 1e-4);
+        assert!(arrow_wings(Vector2 { X: 1.0, Y: 1.0 }, Vector2 { X: 1.0, Y: 1.0 }, 2.0).is_empty());
     }
 }

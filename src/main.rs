@@ -13,7 +13,7 @@
 mod gfx;
 mod layout;
 
-use gfx::{OverlayGfx, Stroke, ToolbarGfx};
+use gfx::{OverlayGfx, Shape, Stroke, ToolbarGfx};
 use layout::Button;
 use std::cell::RefCell;
 use windows::Win32::Foundation::*;
@@ -32,6 +32,9 @@ const OVERLAY_CLASS: PCWSTR = w!("AnnotatorOverlay");
 const TOOLBAR_CLASS: PCWSTR = w!("AnnotatorToolbar");
 const HOTKEY_TOGGLE: usize = 1;
 const PEN_WIDTH_DIP: f32 = 4.0;
+/// How far from a stroke a click still selects it.
+const HIT_TOL_DIP: f32 = 6.0;
+const TIMER_TOPMOST: usize = 1;
 
 struct App {
     overlay: HWND,
@@ -47,6 +50,11 @@ struct App {
     active: Option<(u32, Stroke)>,
     drawing: bool,
     color: usize,
+    shape: Shape,
+    /// Index into `strokes` picked with the Select tool.
+    selected: Option<usize>,
+    /// Pointer id moving the selection and its last position.
+    dragging: Option<(u32, Vector2)>,
 }
 
 thread_local! {
@@ -113,7 +121,8 @@ impl App {
             let Some(g) = &self.ov else { return };
             let strokes = self.strokes.iter().chain(self.active.as_ref().map(|a| &a.1));
             let border = self.drawing.then_some(&self.monitors[..]);
-            match g.render(self.origin, strokes, border) {
+            let sel = self.selected.and_then(|i| self.strokes.get(i)).map(Stroke::bounds);
+            match g.render(self.origin, strokes, border, sel) {
                 Ok(()) => return,
                 Err(e) => {
                     eprintln!("overlay render failed, recreating: {e}");
@@ -132,7 +141,7 @@ impl App {
                     .ok();
             }
             let Some(g) = &self.tb else { return };
-            match g.render(self.drawing, self.color) {
+            match g.render(self.drawing, self.color, self.shape) {
                 Ok(()) => return,
                 Err(_) => self.tb = None, // D2DERR_RECREATE_TARGET and friends
             }
@@ -144,6 +153,8 @@ impl App {
         if let Some((_, s)) = self.active.take() {
             self.strokes.push(s);
         }
+        self.selected = None;
+        self.dragging = None;
         unsafe {
             let ex = GetWindowLongW(self.overlay, GWL_EXSTYLE) as u32;
             SetWindowLongW(self.overlay, GWL_EXSTYLE, overlay_ex_style(ex, drawing) as i32);
@@ -161,21 +172,41 @@ impl App {
         let (x, y) = lparam_point(lp); // screen coords, physical pixels (PMv2)
         let p = Vector2 { X: x as f32, Y: y as f32 };
         match msg {
-            WM_POINTERDOWN if self.drawing && self.active.is_none() => {
+            WM_POINTERDOWN if self.drawing && self.shape == Shape::Select && self.dragging.is_none() => {
+                let tol = HIT_TOL_DIP * dpi_at(p) / 96.0;
+                // Topmost (last drawn) stroke wins.
+                self.selected = self.strokes.iter().rposition(|s| s.hit(p, tol));
+                self.dragging = self.selected.map(|_| (id, p));
+            }
+            WM_POINTERUPDATE | WM_POINTERUP if self.dragging.is_some_and(|d| d.0 == id) => {
+                let last = self.dragging.unwrap().1;
+                if let Some(s) = self.selected.and_then(|i| self.strokes.get_mut(i)) {
+                    s.translate(p.X - last.X, p.Y - last.Y);
+                }
+                self.dragging = (msg == WM_POINTERUPDATE).then_some((id, p));
+            }
+            WM_POINTERDOWN if self.drawing && self.shape != Shape::Select && self.active.is_none() => {
                 let c = layout::COLORS[self.color];
                 let width = PEN_WIDTH_DIP * dpi_at(p) / 96.0;
-                self.active = Some((id, Stroke { color: gfx::rgb(c, 1.0), width, points: vec![p] }));
+                self.active = Some((id, Stroke { shape: self.shape, color: gfx::rgb(c, 1.0), width, points: vec![p] }));
             }
             WM_POINTERUPDATE => match &mut self.active {
                 Some((aid, s)) if *aid == id => {
-                    if s.points.last() != Some(&p) {
+                    if s.shape != Shape::Pen && s.points.len() == 2 {
+                        s.points[1] = p; // shapes keep only [start, current end]
+                    } else if s.points.last() != Some(&p) {
                         s.points.push(p);
                     }
                 }
                 _ => return,
             },
             WM_POINTERUP => match self.active.take() {
-                Some((aid, s)) if aid == id => self.strokes.push(s),
+                Some((aid, s)) if aid == id => {
+                    // A shape clicked without dragging is invisible; drop it so Undo isn't wasted on it.
+                    if s.shape == Shape::Pen || s.points.len() == 2 {
+                        self.strokes.push(s);
+                    }
+                }
                 other => {
                     self.active = other;
                     return;
@@ -194,12 +225,20 @@ impl App {
                 self.color = i;
                 self.set_mode(true);
             }
+            Some(Button::Shape(i)) => {
+                self.shape = Shape::ALL[i];
+                self.set_mode(true);
+            }
             Some(Button::Undo) => {
                 self.strokes.pop();
+                self.selected = None;
+                self.dragging = None;
                 self.render_overlay();
             }
             Some(Button::Clear) => {
                 self.strokes.clear();
+                self.selected = None;
+                self.dragging = None;
                 self.render_overlay();
             }
             Some(Button::Exit) => unsafe {
@@ -231,6 +270,23 @@ extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         WM_HOTKEY if wp.0 == HOTKEY_TOGGLE => with_app(|a| a.set_mode(!a.drawing)).is_some(),
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => with_app(|a| a.set_mode(false)).is_some(),
         WM_DISPLAYCHANGE => with_app(|a| a.on_display_change()).is_some(),
+        // Other topmost windows (taskbar, other always-on-top apps) can rise above
+        // us when activated; keep re-asserting so the ink stays on top.
+        // shortcut: Start menu and similar shell UI still win; beating them needs a signed UIAccess build.
+        WM_TIMER if wp.0 == TIMER_TOPMOST => unsafe {
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+            if let Some(tb) = with_app(|a| a.toolbar) {
+                let _ = SetWindowPos(tb, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+            }
+            true
+        },
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && with_app(|a| a.shape == Shape::Select) == Some(true) => unsafe {
+            if let Ok(c) = LoadCursorW(None, IDC_SIZEALL) {
+                SetCursor(Some(c));
+            }
+            true
+        },
         // The overlay spans every monitor; never let a DPI change resize it.
         WM_DPICHANGED => true,
         WM_DESTROY => {
@@ -376,6 +432,9 @@ fn run() -> Result<()> {
                 active: None,
                 drawing: true,
                 color: 0,
+                shape: Shape::Pen,
+                selected: None,
+                dragging: None,
             });
             Ok::<_, Error>(())
         })?;
@@ -383,6 +442,7 @@ fn run() -> Result<()> {
         let _ = ShowWindow(overlay, SW_SHOWNOACTIVATE);
         let _ = ShowWindow(toolbar, SW_SHOWNOACTIVATE);
         with_app(|a| a.set_mode(true));
+        SetTimer(Some(overlay), TIMER_TOPMOST, 500, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
