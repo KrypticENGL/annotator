@@ -55,6 +55,8 @@ struct App {
     selected: Option<usize>,
     /// Pointer id moving the selection and its last position.
     dragging: Option<(u32, Vector2)>,
+    /// Pointer id currently erasing.
+    erasing: Option<u32>,
 }
 
 thread_local! {
@@ -155,6 +157,7 @@ impl App {
         }
         self.selected = None;
         self.dragging = None;
+        self.erasing = None;
         unsafe {
             let ex = GetWindowLongW(self.overlay, GWL_EXSTYLE) as u32;
             SetWindowLongW(self.overlay, GWL_EXSTYLE, overlay_ex_style(ex, drawing) as i32);
@@ -185,7 +188,24 @@ impl App {
                 }
                 self.dragging = (msg == WM_POINTERUPDATE).then_some((id, p));
             }
-            WM_POINTERDOWN if self.drawing && self.shape != Shape::Select && self.active.is_none() => {
+            WM_POINTERDOWN | WM_POINTERUPDATE
+                if (msg == WM_POINTERDOWN && self.drawing && self.shape == Shape::Eraser && self.erasing.is_none())
+                    || (msg == WM_POINTERUPDATE && self.erasing == Some(id)) =>
+            {
+                // shortcut: tests only sampled pointer positions, so a very fast swipe can skip a thin stroke; test the swept segment if that bites.
+                let tol = HIT_TOL_DIP * dpi_at(p) / 96.0;
+                let before = self.strokes.len();
+                self.strokes.retain(|s| !s.hit(p, tol));
+                self.erasing = Some(id);
+                if self.strokes.len() == before {
+                    return;
+                }
+            }
+            WM_POINTERUP if self.erasing == Some(id) => {
+                self.erasing = None;
+                return;
+            }
+            WM_POINTERDOWN if self.drawing && !matches!(self.shape, Shape::Select | Shape::Eraser) && self.active.is_none() => {
                 let c = layout::COLORS[self.color];
                 let width = PEN_WIDTH_DIP * dpi_at(p) / 96.0;
                 self.active = Some((id, Stroke { shape: self.shape, color: gfx::rgb(c, 1.0), width, points: vec![p] }));
@@ -435,6 +455,7 @@ fn run() -> Result<()> {
                 shape: Shape::Pen,
                 selected: None,
                 dragging: None,
+                erasing: None,
             });
             Ok::<_, Error>(())
         })?;

@@ -19,6 +19,8 @@ use windows_numerics::{Matrix3x2, Vector2};
 pub enum Shape {
     /// The selection tool; never stored in a `Stroke`.
     Select,
+    /// Deletes whole strokes it touches; never stored in a `Stroke`.
+    Eraser,
     Pen,
     Line,
     Arrow,
@@ -28,13 +30,15 @@ pub enum Shape {
 
 impl Shape {
     /// Toolbar order; `Button::Shape(i)` indexes this.
-    pub const ALL: [Shape; 6] = [Shape::Select, Shape::Pen, Shape::Line, Shape::Arrow, Shape::Rect, Shape::Ellipse];
+    pub const ALL: [Shape; 7] = [Shape::Select, Shape::Eraser, Shape::Pen, Shape::Line, Shape::Arrow, Shape::Rect, Shape::Ellipse];
 
     /// Toolbar icon geometry around (cx, cy), in DIPs.
     fn icon_points(self, cx: f32, cy: f32) -> Vec<Vector2> {
         let pts: &[(f32, f32)] = match self {
             // Mouse-pointer outline, drawn as a Pen polyline.
             Shape::Select => &[(-4.0, -8.0), (-4.0, 7.0), (0.0, 3.0), (3.0, 9.0), (5.0, 8.0), (2.0, 2.0), (7.0, 2.0), (-4.0, -8.0)],
+            // Tilted eraser block with a band across it, drawn as one Pen polyline.
+            Shape::Eraser => &[(-7.0, 2.0), (-1.0, -4.0), (6.0, 3.0), (0.0, 9.0), (-7.0, 2.0), (-4.0, -1.0), (3.0, 6.0)],
             Shape::Pen => &[(-8.0, 4.0), (-3.0, -4.0), (2.0, 4.0), (7.0, -4.0)],
             Shape::Line | Shape::Arrow => &[(-7.0, 7.0), (7.0, -7.0)],
             Shape::Rect | Shape::Ellipse => &[(-8.0, -6.0), (8.0, 6.0)],
@@ -396,7 +400,7 @@ impl ToolbarGfx {
                         }
                         self.brush.SetColor(&white);
                         let pts = s.icon_points((x0 + x1) / 2.0, layout::HEIGHT / 2.0);
-                        let kind = if s == Shape::Select { Shape::Pen } else { s };
+                        let kind = if matches!(s, Shape::Select | Shape::Eraser) { Shape::Pen } else { s };
                         draw_stroke(rt, kind, &pts, 2.0, &self.brush, &self.round);
                         continue;
                     }

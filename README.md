@@ -11,9 +11,10 @@ cargo run --release
 - **Draw mode** (orange border, toolbar shows *Draw*): the mouse, pen or touch draws ink.
 - **Pass mode** (toolbar shows *Pass*): your ink stays on screen and every click reaches the windows underneath, even clicks on top of the ink.
 - **Select tool**: click on any line, shape or pen stroke to select it (an orange box appears), then drag to move it. Rectangles and ovals are picked by their outline, not their inside. Click empty space to deselect.
+- **Eraser tool**: click or drag across ink to delete every stroke or shape it touches (whole strokes, not parts of them).
 - The overlay re-asserts itself as topmost every 500 ms, so ink stays above other always-on-top windows and the taskbar.
 - Switch modes with **Ctrl+Shift+D**, the toolbar's Mode button, or **Esc** (which only leaves draw mode).
-- Toolbar: drag it by the grip on the left. Its buttons are tools (Select, Pen, Line, Arrow, Rectangle, Oval; the active one is highlighted), colors (choosing a shape or a color switches to draw mode), Undo, Clear and Exit.
+- Toolbar: drag it by the grip on the left. Its buttons are tools (Select, Eraser, Pen, Line, Arrow, Rectangle, Oval; the active one is highlighted), colors (choosing a shape or a color switches to draw mode), Undo, Clear and Exit.
 
 ## How it works
 
